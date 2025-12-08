@@ -1,3 +1,14 @@
+# app.py - Python Flask API for YouTube Downloader using InnerTube API (No IP Bans)
+# Deploy on Render: 
+# 1. Create new Web Service > Python.
+# 2. Upload this as app.py.
+# 3. requirements.txt: flask==3.0.3 innertube==0.7.0 ffmpeg-python==0.2.0 requests==2.32.3
+# 4. build.sh: apt-get update && apt-get install -y ffmpeg
+# 5. runtime.txt: python-3.12.7
+# 6. Start command: gunicorn app:app (add gunicorn to reqs)
+# Test: POST /download {"url": "https://youtu.be/dQw4w9WgXcQ"}
+# Notes: InnerTube API has high/no limits, mimics web client to avoid bans. Add rate limiting for production.
+
 from flask import Flask, request, jsonify, send_file, abort, Response
 import innertube
 import os
