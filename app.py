@@ -209,7 +209,7 @@ def online_formats():
     return jsonify(response)
 
 if __name__ == '__main__':
-    # Initialize InnerTube client before serving
     init_client()
-    # Run on port 8080 as requested
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    import os
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
