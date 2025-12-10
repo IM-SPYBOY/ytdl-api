@@ -1,31 +1,31 @@
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify
 import innertube
 import os
-import tempfile
 import re
 import time
-from urllib.parse import urlencode
+import json
 
 app = Flask(__name__)
 
-# --- Config ---
-TEMP_DIR = tempfile.mkdtemp(prefix='yt_merge_')
-os.makedirs(TEMP_DIR, exist_ok=True)
-REQUEST_DELAY = 0.5  # reduced delay
+REQUEST_DELAY = 0.5
 INNER_CLIENT = None
 
-# --- Init InnerTube client ---
 def init_client():
     global INNER_CLIENT
     if INNER_CLIENT is None:
         try:
             INNER_CLIENT = innertube.InnerTube("WEB")
-            app.logger.info("InnerTube client initialized successfully")
+            app.logger.info("InnerTube WEB client initialized")
         except Exception as e:
             app.logger.error(f"Failed to init InnerTube: {e}")
+            try:
+                INNER_CLIENT = innertube.InnerTube("ANDROID")
+                app.logger.info("InnerTube ANDROID client initialized (fallback)")
+            except Exception as e2:
+                app.logger.error(f"Failed to init ANDROID client: {e2}")
+                INNER_CLIENT = None
     return INNER_CLIENT
 
-# --- Helpers ---
 VIDEO_ID_PATTERNS = [
     r'(?:v=|\/)([0-9A-Za-z_-]{11})',
     r'youtu\.be\/([0-9A-Za-z_-]{11})'
@@ -54,9 +54,6 @@ def safe_int(v):
             return None
 
 def normalize_format_entry(f):
-    """
-    Normalize an InnerTube format entry into a predictable dict.
-    """
     mime = f.get('mimeType', '') or ''
     ext = 'mp4'
     try:
@@ -65,66 +62,74 @@ def normalize_format_entry(f):
     except Exception:
         pass
 
-    filesize = f.get('contentLength') or f.get('content_length') or f.get('clen')
+    filesize = f.get('contentLength') or f.get('content_length')
     filesize = safe_int(filesize)
 
     mime_lower = mime.lower()
     has_video = 'video' in mime_lower
     has_audio = 'audio' in mime_lower
 
-    # Extract codec info more carefully
     vcodec = f.get('vcodec')
     acodec = f.get('acodec')
     
-    if vcodec is None:
-        vcodec = 'avc1.4d401e' if has_video else 'none'
-    if acodec is None:
-        acodec = 'mp4a.40.2' if has_audio else 'none'
+    if not vcodec and has_video:
+        try:
+            if 'codecs=' in mime:
+                codecs_str = mime.split('codecs=')[1].strip('"\'')
+                vcodec = codecs_str.split(',')[0] if ',' in codecs_str else codecs_str
+        except Exception:
+            vcodec = 'avc1'
+    
+    if not acodec and has_audio:
+        try:
+            if 'codecs=' in mime:
+                codecs_str = mime.split('codecs=')[1].strip('"\'')
+                parts = codecs_str.split(',')
+                acodec = parts[-1] if len(parts) > 1 else parts[0]
+        except Exception:
+            acodec = 'mp4a'
 
     return {
         'itag': f.get('itag'),
         'url': f.get('url'),
         'mimeType': mime,
         'ext': ext,
-        'qualityLabel': f.get('qualityLabel') or f.get('quality'),
+        'qualityLabel': f.get('qualityLabel') or f.get('quality_label'),
         'height': safe_int(f.get('height')),
         'width': safe_int(f.get('width')),
         'fps': safe_int(f.get('fps')),
-        'abr': safe_int(f.get('audioBitrate')) or safe_int(f.get('abr')),
-        'vbr': safe_int(f.get('bitrate')) or safe_int(f.get('vbr')),
+        'abr': safe_int(f.get('audioBitrate') or f.get('audio_bitrate')),
+        'vbr': safe_int(f.get('bitrate') or f.get('video_bitrate')),
         'filesize': filesize,
-        'vcodec': vcodec,
-        'acodec': acodec,
+        'vcodec': vcodec or ('avc1' if has_video else 'none'),
+        'acodec': acodec or ('mp4a' if has_audio else 'none'),
         'has_video': has_video,
         'has_audio': has_audio,
     }
 
 def get_yt_formats_and_meta(video_id: str):
-    """
-    Uses InnerTube to fetch player data and returns (title, [normalized_formats]).
-    """
     client = init_client()
     if client is None:
-        app.logger.error("InnerTube client is None")
-        return None, None
+        app.logger.error("InnerTube client initialization failed")
+        return None, None, None
     
     try:
         time.sleep(REQUEST_DELAY)
-        app.logger.info(f"Fetching formats for video_id: {video_id}")
+        app.logger.info(f"Fetching player data for video_id: {video_id}")
         player_data = client.player(video_id=video_id)
-        app.logger.info(f"Player data received: keys = {list(player_data.keys())}")
+        app.logger.info(f"Player response keys: {list(player_data.keys())}")
+        
     except Exception as e:
-        app.logger.exception(f"InnerTube player error for {video_id}: {e}")
-        return None, None
+        app.logger.exception(f"InnerTube player error: {e}")
+        return None, None, None
 
     title = None
     try:
         vd = player_data.get('videoDetails') or {}
         title = vd.get('title')
-        app.logger.info(f"Title: {title}")
+        app.logger.info(f"Video title: {title}")
     except Exception as e:
         app.logger.error(f"Error extracting title: {e}")
-        title = None
 
     streaming_data = player_data.get('streamingData') or {}
     app.logger.info(f"StreamingData keys: {list(streaming_data.keys())}")
@@ -132,107 +137,112 @@ def get_yt_formats_and_meta(video_id: str):
     formats_raw = []
     for key in ('formats', 'adaptiveFormats'):
         key_formats = streaming_data.get(key) or []
-        app.logger.info(f"Found {len(key_formats)} formats in '{key}'")
+        app.logger.info(f"Found {len(key_formats)} in '{key}'")
         formats_raw.extend(key_formats)
 
-    app.logger.info(f"Total raw formats: {len(formats_raw)}")
-    
+    app.logger.info(f"Total raw formats collected: {len(formats_raw)}")
+
+    if not formats_raw:
+        app.logger.warning("No formats found in response")
+        app.logger.warning(f"Raw streamingData: {json.dumps(streaming_data, indent=2)[:500]}")
+
     formats = []
     for i, f in enumerate(formats_raw):
         norm = normalize_format_entry(f)
+        
         if not norm.get('url'):
-            app.logger.warning(f"Format {i} has no URL, skipping")
+            app.logger.debug(f"Format {i}: Skipped (no URL)")
             continue
-        app.logger.info(f"Format {i}: itag={norm.get('itag')}, vcodec={norm.get('vcodec')}, acodec={norm.get('acodec')}, url_exists={bool(norm.get('url'))}")
+        
+        app.logger.info(f"Format {i}: itag={norm.get('itag')}, ext={norm.get('ext')}, "
+                       f"has_video={norm.get('has_video')}, has_audio={norm.get('has_audio')}")
         formats.append(norm)
 
     app.logger.info(f"Total normalized formats with URLs: {len(formats)}")
-    return title, formats
-
-# --- Routes ---
+    return title, video_id, formats
 
 @app.route('/', methods=['GET', 'HEAD'])
 def root():
-    """
-    If URL param is provided, handle it. Otherwise return status.
-    """
     youtube_url = request.args.get('url') or request.args.get('u')
     
-    if youtube_url:
-        # Handle the request directly
-        if not any(domain in youtube_url for domain in ('youtube.com', 'youtu.be')):
-            return jsonify({'error': 'url does not look like a YouTube URL'}), 400
+    if not youtube_url:
+        return jsonify({"status": "ok", "service": "yt-formats-api", "version": "1.0"}), 200
+    
+    if not any(domain in youtube_url for domain in ('youtube.com', 'youtu.be')):
+        return jsonify({'error': 'url does not look like a YouTube URL'}), 400
 
-        video_id = extract_video_id(youtube_url)
-        if not video_id:
-            return jsonify({'error': 'could not extract video id from url'}), 400
+    video_id = extract_video_id(youtube_url)
+    if not video_id:
+        return jsonify({'error': 'could not extract video id from url'}), 400
 
-        title, formats = get_yt_formats_and_meta(video_id)
-        if formats is None:
-            return jsonify({'error': 'failed to fetch formats from InnerTube', 'video_id': video_id}), 500
-
-        muxed = []
-        videos = []
-        audios = []
-
-        for f in formats:
-            vcodec = f.get('vcodec') or 'none'
-            acodec = f.get('acodec') or 'none'
-            has_video = f.get('has_video', vcodec != 'none')
-            has_audio = f.get('has_audio', acodec != 'none')
-
-            entry = {
-                'itag': f.get('itag'),
-                'mimeType': f.get('mimeType'),
-                'ext': f.get('ext'),
-                'qualityLabel': f.get('qualityLabel'),
-                'height': f.get('height'),
-                'width': f.get('width'),
-                'fps': f.get('fps'),
-                'abr': f.get('abr'),
-                'vbr': f.get('vbr'),
-                'filesize': f.get('filesize'),
-                'vcodec': vcodec,
-                'acodec': acodec,
-                'url': f.get('url'),
-            }
-
-            if has_video and has_audio:
-                muxed.append(entry)
-            elif has_video and not has_audio:
-                videos.append(entry)
-            elif has_audio and not has_video:
-                audios.append(entry)
-
-        def height_key(e):
-            return (e.get('height') or 0, e.get('fps') or 0, e.get('filesize') or 0)
-
-        muxed.sort(key=height_key, reverse=True)
-        videos.sort(key=height_key, reverse=True)
-        audios.sort(key=lambda e: (e.get('abr') or 0, e.get('filesize') or 0), reverse=True)
-
+    title, vid_id, formats = get_yt_formats_and_meta(video_id)
+    
+    if formats is None:
         return jsonify({
-            'status': 'ok',
+            'error': 'failed to fetch formats from InnerTube',
+            'video_id': video_id,
+            'url': youtube_url
+        }), 500
+
+    if not formats:
+        return jsonify({
+            'error': 'no formats found for this video',
             'video_id': video_id,
             'title': title,
-            'requested_url': youtube_url,
-            'muxed_formats': muxed,
-            'video_formats': videos,
-            'audio_formats': audios,
-            'total_formats': len(formats),
-            'note': 'filesize may be null if not provided by source'
-        }), 200
-    
-    # No URL provided, return health check
-    return jsonify({"status": "ok", "service": "yt-formats-api", "version": "1.0"}), 200
+            'url': youtube_url
+        }), 404
+
+    muxed = []
+    videos = []
+    audios = []
+
+    for f in formats:
+        has_video = f.get('has_video', False)
+        has_audio = f.get('has_audio', False)
+
+        entry = {
+            'itag': f.get('itag'),
+            'ext': f.get('ext'),
+            'mimeType': f.get('mimeType'),
+            'qualityLabel': f.get('qualityLabel'),
+            'height': f.get('height'),
+            'width': f.get('width'),
+            'fps': f.get('fps'),
+            'vcodec': f.get('vcodec'),
+            'acodec': f.get('acodec'),
+            'abr': f.get('abr'),
+            'vbr': f.get('vbr'),
+            'filesize': f.get('filesize'),
+            'url': f.get('url'),
+        }
+
+        if has_video and has_audio:
+            muxed.append(entry)
+        elif has_video:
+            videos.append(entry)
+        elif has_audio:
+            audios.append(entry)
+
+    muxed.sort(key=lambda e: (e.get('height') or 0, e.get('fps') or 0, e.get('filesize') or 0), reverse=True)
+    videos.sort(key=lambda e: (e.get('height') or 0, e.get('fps') or 0, e.get('filesize') or 0), reverse=True)
+    audios.sort(key=lambda e: (e.get('abr') or 0, e.get('filesize') or 0), reverse=True)
+
+    return jsonify({
+        'status': 'ok',
+        'video_id': vid_id,
+        'title': title,
+        'requested_url': youtube_url,
+        'muxed_formats': muxed,
+        'video_formats': videos,
+        'audio_formats': audios,
+        'total_formats': len(formats),
+    }), 200
 
 
 @app.route('/online', methods=['GET'])
 def online_formats():
-    """
-    GET /online?url=<YOUTUBE_URL>
-    """
     youtube_url = request.args.get('url') or request.args.get('u')
+    
     if not youtube_url:
         return jsonify({'error': 'missing "url" query parameter'}), 400
 
@@ -243,60 +253,65 @@ def online_formats():
     if not video_id:
         return jsonify({'error': 'could not extract video id from url'}), 400
 
-    title, formats = get_yt_formats_and_meta(video_id)
+    title, vid_id, formats = get_yt_formats_and_meta(video_id)
+    
     if formats is None:
-        return jsonify({'error': 'failed to fetch formats from InnerTube'}), 500
+        return jsonify({
+            'error': 'failed to fetch formats from InnerTube',
+            'video_id': video_id,
+        }), 500
+
+    if not formats:
+        return jsonify({
+            'error': 'no formats found for this video',
+            'video_id': video_id,
+            'title': title,
+        }), 404
 
     muxed = []
     videos = []
     audios = []
 
     for f in formats:
-        vcodec = f.get('vcodec') or 'none'
-        acodec = f.get('acodec') or 'none'
-        has_video = f.get('has_video', vcodec != 'none')
-        has_audio = f.get('has_audio', acodec != 'none')
+        has_video = f.get('has_video', False)
+        has_audio = f.get('has_audio', False)
 
         entry = {
             'itag': f.get('itag'),
-            'mimeType': f.get('mimeType'),
             'ext': f.get('ext'),
+            'mimeType': f.get('mimeType'),
             'qualityLabel': f.get('qualityLabel'),
             'height': f.get('height'),
             'width': f.get('width'),
             'fps': f.get('fps'),
+            'vcodec': f.get('vcodec'),
+            'acodec': f.get('acodec'),
             'abr': f.get('abr'),
             'vbr': f.get('vbr'),
             'filesize': f.get('filesize'),
-            'vcodec': vcodec,
-            'acodec': acodec,
             'url': f.get('url'),
         }
 
         if has_video and has_audio:
             muxed.append(entry)
-        elif has_video and not has_audio:
+        elif has_video:
             videos.append(entry)
-        elif has_audio and not has_video:
+        elif has_audio:
             audios.append(entry)
 
-    def height_key(e):
-        return (e.get('height') or 0, e.get('fps') or 0, e.get('filesize') or 0)
-
-    muxed.sort(key=height_key, reverse=True)
-    videos.sort(key=height_key, reverse=True)
+    muxed.sort(key=lambda e: (e.get('height') or 0, e.get('fps') or 0, e.get('filesize') or 0), reverse=True)
+    videos.sort(key=lambda e: (e.get('height') or 0, e.get('fps') or 0, e.get('filesize') or 0), reverse=True)
     audios.sort(key=lambda e: (e.get('abr') or 0, e.get('filesize') or 0), reverse=True)
 
     return jsonify({
         'status': 'ok',
-        'video_id': video_id,
+        'video_id': vid_id,
         'title': title,
         'requested_url': youtube_url,
         'muxed_formats': muxed,
         'video_formats': videos,
         'audio_formats': audios,
         'total_formats': len(formats),
-        'note': 'filesize may be null if not provided by source'
     }), 200
 
 
@@ -305,7 +320,6 @@ def webhook():
     return jsonify({"status": "webhook-alive"}), 200
 
 
-# --- Main for local dev ---
 if __name__ == '__main__':
     init_client()
     port = int(os.environ.get('PORT', 8080))
