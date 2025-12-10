@@ -1,18 +1,10 @@
-#!/usr/bin/env python3
-"""
-YouTube Formats API — Full app.py
-
-Expose:
-  - GET /          -> simple health check (200 OK)
-  - GET /online    -> ?url=<YOUTUBE_URL> returns all muxed/video/audio formats (with direct URLs)
-"""
-
 from flask import Flask, request, jsonify
 import innertube
 import os
 import tempfile
 import re
 import time
+import sys
 
 app = Flask(__name__)
 
@@ -216,8 +208,9 @@ def webhook():
     return jsonify({"status": "webhook-alive"}), 200
 
 
-# --- Main for local dev only ---
+# --- Gunicorn entry point ---
 if __name__ == '__main__':
     init_client()
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # Use 0.0.0.0 to bind to all interfaces (required for most cloud platforms)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
