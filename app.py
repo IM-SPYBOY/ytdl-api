@@ -7,6 +7,11 @@ import time
 app = Flask(__name__)
 REQUEST_DELAY = 1.0  # Slight delay to be gentle on YouTube
 
+# Path to your cookies.txt file (update this to the full path if needed)
+# For example: '/path/to/your/cookies.txt' or on Windows 'C:\\path\\to\\cookies.txt'
+# If the file is in the same directory as the script, just 'cookies.txt'
+COOKIES_FILE = 'cookies.txt'  # Change this if the file is elsewhere
+
 VIDEO_ID_PATTERNS = [
     r'(?:v=|\/)([0-9A-Za-z_-]{11})',
     r'youtu\.be\/([0-9A-Za-z_-]{11})'
@@ -37,13 +42,18 @@ def get_yt_formats_and_meta(youtube_url: str):
         'no_warnings': True,
         'skip_download': True,
         'extract_flat': False,
-        # Mimic a real browser to reduce bot detection risk
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         },
-        # Optional: add 'proxy': 'http://your-proxy:port' if needed for heavy use
     }
+
+    # Add cookies if the file exists
+    if os.path.exists(COOKIES_FILE):
+        ydl_opts['cookiefile'] = COOKIES_FILE
+        app.logger.info(f"Loading cookies from {COOKIES_FILE}")
+    else:
+        app.logger.warning(f"Cookies file not found: {COOKIES_FILE}")
 
     try:
         time.sleep(REQUEST_DELAY)
@@ -97,8 +107,8 @@ def get_yt_formats_and_meta(youtube_url: str):
     except Exception as e:
         app.logger.exception(f"yt-dlp error: {e}")
         error_msg = str(e)
-        if "Sign in to confirm" in error_msg or "LOGIN_REQUIRED" in error_msg:
-            return None, video_id or "unknown", [], "LOGIN_REQUIRED", "Sign in to confirm you’re not a bot (bot detection triggered)"
+        if "Sign in to confirm" in error_msg or "LOGIN_REQUIRED" in error_msg or "bot" in error_msg.lower():
+            return None, None, [], "LOGIN_REQUIRED", "Sign in to confirm you’re not a bot (bot detection triggered - cookies may help or need refresh/proxy)"
         return None, None, [], "ERROR", error_msg
 
 @app.route('/', methods=['GET', 'HEAD'])
@@ -107,7 +117,7 @@ def formats_endpoint():
     youtube_url = request.args.get('url') or request.args.get('u')
 
     if not youtube_url:
-        return jsonify({"status": "ok", "service": "yt-formats-api (yt-dlp backend)", "version": "2.0"}), 200
+        return jsonify({"status": "ok", "service": "yt-formats-api (yt-dlp backend with cookies)", "version": "2.1"}), 200
 
     if not any(domain in youtube_url for domain in ('youtube.com', 'youtu.be')):
         return jsonify({'error': 'url does not look like a YouTube URL'}), 400
@@ -116,7 +126,14 @@ def formats_endpoint():
     if not video_id:
         return jsonify({'error': 'could not extract video id from url'}), 400
 
-    title, vid_id, formats, err_status, err_reason = get_yt_formats_and_meta(youtube_url)
+    title, vid_id, formats, err_status, err_reason = get_yt_formats_and_meta(youtube_url) if len(get_yt_formats_and_meta(youtube_url)) == 3 else (*get_yt_formats_and_meta(youtube_url), None, None)
+
+    # Adjust for return values (now returns 3 or 5 items)
+    if len(get_yt_formats_and_meta(youtube_url)) > 3:
+        title, vid_id, formats, err_status, err_reason = get_yt_formats_and_meta(youtube_url)
+    else:
+        title, vid_id, formats = get_yt_formats_and_meta(youtube_url)
+        err_status = err_reason = None
 
     if err_status:
         return jsonify({
@@ -125,7 +142,7 @@ def formats_endpoint():
             'requested_url': youtube_url,
             'playability_status': err_status,
             'playability_reason': err_reason,
-            'note': 'yt-dlp encountered a restriction (often bot detection). Try updating yt-dlp, using a proxy, or cookies from a logged-in browser.'
+            'note': 'yt-dlp encountered a restriction. Ensure cookies.txt is valid and up-to-date. Consider using a proxy or refreshing cookies.'
         }), 500 if err_status == "ERROR" else 403
 
     if not formats:
@@ -147,7 +164,6 @@ def formats_endpoint():
     videos.sort(key=lambda e: (e.get('height') or 0, e.get('fps') or 0, e.get('filesize') or 0), reverse=True)
     audios.sort(key=lambda e: (e.get('abr') or 0, e.get('filesize') or 0), reverse=True)
 
-    # Build entry dicts (similar to original)
     def build_entry(f):
         return {
             'itag': f['itag'],
@@ -174,6 +190,7 @@ def formats_endpoint():
         'video_formats': [build_entry(f) for f in videos],
         'audio_formats': [build_entry(f) for f in audios],
         'total_formats': len(formats),
+        'note': f'Using cookies from {COOKIES_FILE}' if os.path.exists(COOKIES_FILE) else 'No cookies file found - running anonymously',
     }), 200
 
 @app.route('/webhook', methods=['GET', 'POST'])
