@@ -5,12 +5,10 @@ import re
 import time
 
 app = Flask(__name__)
-REQUEST_DELAY = 1.0  # Slight delay to be gentle on YouTube
+REQUEST_DELAY = 1.0
 
-# Path to your cookies.txt file (update this to the full path if needed)
-# For example: '/path/to/your/cookies.txt' or on Windows 'C:\\path\\to\\cookies.txt'
-# If the file is in the same directory as the script, just 'cookies.txt'
-COOKIES_FILE = 'cookies.txt'  # Change this if the file is elsewhere
+# Path to your cookies.txt file
+COOKIES_FILE = 'cookies.txt'  # Update if needed (e.g., full path on Render)
 
 VIDEO_ID_PATTERNS = [
     r'(?:v=|\/)([0-9A-Za-z_-]{11})',
@@ -48,9 +46,9 @@ def get_yt_formats_and_meta(youtube_url: str):
         },
     }
 
-    # Add cookies if the file exists
+    # Correct option for Netscape cookies.txt
     if os.path.exists(COOKIES_FILE):
-        ydl_opts['cookiefile'] = COOKIES_FILE
+        ydl_opts['cookies'] = COOKIES_FILE  # <-- Fixed: 'cookies' not 'cookiefile'
         app.logger.info(f"Loading cookies from {COOKIES_FILE}")
     else:
         app.logger.warning(f"Cookies file not found: {COOKIES_FILE}")
@@ -107,8 +105,8 @@ def get_yt_formats_and_meta(youtube_url: str):
     except Exception as e:
         app.logger.exception(f"yt-dlp error: {e}")
         error_msg = str(e)
-        if "Sign in to confirm" in error_msg or "LOGIN_REQUIRED" in error_msg or "bot" in error_msg.lower():
-            return None, None, [], "LOGIN_REQUIRED", "Sign in to confirm you’re not a bot (bot detection triggered - cookies may help or need refresh/proxy)"
+        if "Sign in to confirm" in error_msg or "bot" in error_msg.lower() or "LOGIN_REQUIRED" in error_msg:
+            return None, None, [], "LOGIN_REQUIRED", "Sign in to confirm you’re not a bot (cookies may be invalid, expired, or need refresh/proxy)"
         return None, None, [], "ERROR", error_msg
 
 @app.route('/', methods=['GET', 'HEAD'])
@@ -117,7 +115,7 @@ def formats_endpoint():
     youtube_url = request.args.get('url') or request.args.get('u')
 
     if not youtube_url:
-        return jsonify({"status": "ok", "service": "yt-formats-api (yt-dlp backend with cookies)", "version": "2.1"}), 200
+        return jsonify({"status": "ok", "service": "yt-formats-api (yt-dlp backend with cookies)", "version": "2.2"}), 200
 
     if not any(domain in youtube_url for domain in ('youtube.com', 'youtu.be')):
         return jsonify({'error': 'url does not look like a YouTube URL'}), 400
@@ -126,13 +124,12 @@ def formats_endpoint():
     if not video_id:
         return jsonify({'error': 'could not extract video id from url'}), 400
 
-    title, vid_id, formats, err_status, err_reason = get_yt_formats_and_meta(youtube_url) if len(get_yt_formats_and_meta(youtube_url)) == 3 else (*get_yt_formats_and_meta(youtube_url), None, None)
-
-    # Adjust for return values (now returns 3 or 5 items)
-    if len(get_yt_formats_and_meta(youtube_url)) > 3:
-        title, vid_id, formats, err_status, err_reason = get_yt_formats_and_meta(youtube_url)
-    else:
-        title, vid_id, formats = get_yt_formats_and_meta(youtube_url)
+    # Fixed: Call the function once and handle return properly
+    result = get_yt_formats_and_meta(youtube_url)
+    if len(result) == 5:
+        title, vid_id, formats, err_status, err_reason = result
+    else:  # len == 3
+        title, vid_id, formats = result
         err_status = err_reason = None
 
     if err_status:
@@ -142,7 +139,7 @@ def formats_endpoint():
             'requested_url': youtube_url,
             'playability_status': err_status,
             'playability_reason': err_reason,
-            'note': 'yt-dlp encountered a restriction. Ensure cookies.txt is valid and up-to-date. Consider using a proxy or refreshing cookies.'
+            'note': 'yt-dlp restriction encountered. Check cookies validity, update yt-dlp, or add a proxy.'
         }), 500 if err_status == "ERROR" else 403
 
     if not formats:
@@ -151,15 +148,14 @@ def formats_endpoint():
             'video_id': vid_id or video_id,
             'title': title,
             'requested_url': youtube_url,
-            'note': 'Video may be unavailable, private, or heavily restricted.'
+            'note': 'Video may be unavailable or restricted.'
         }), 404
 
-    # Categorize formats
+    # Categorize and sort
     muxed = [f for f in formats if f['has_video'] and f['has_audio']]
     videos = [f for f in formats if f['has_video'] and not f['has_audio']]
     audios = [f for f in formats if f['has_audio'] and not f['has_video']]
 
-    # Sorting
     muxed.sort(key=lambda e: (e.get('height') or 0, e.get('fps') or 0, e.get('filesize') or 0), reverse=True)
     videos.sort(key=lambda e: (e.get('height') or 0, e.get('fps') or 0, e.get('filesize') or 0), reverse=True)
     audios.sort(key=lambda e: (e.get('abr') or 0, e.get('filesize') or 0), reverse=True)
@@ -181,6 +177,8 @@ def formats_endpoint():
             'url': f['url'],
         }
 
+    cookies_note = f'Using cookies from {COOKIES_FILE}' if os.path.exists(COOKIES_FILE) else 'No cookies file - running anonymously'
+
     return jsonify({
         'status': 'ok',
         'video_id': vid_id or video_id,
@@ -190,7 +188,7 @@ def formats_endpoint():
         'video_formats': [build_entry(f) for f in videos],
         'audio_formats': [build_entry(f) for f in audios],
         'total_formats': len(formats),
-        'note': f'Using cookies from {COOKIES_FILE}' if os.path.exists(COOKIES_FILE) else 'No cookies file found - running anonymously',
+        'note': cookies_note,
     }), 200
 
 @app.route('/webhook', methods=['GET', 'POST'])
