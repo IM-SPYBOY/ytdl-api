@@ -1,5 +1,5 @@
 flask
-innertube
+yt-dlp
 ffmpeg-python
 requests
 gunicorn
